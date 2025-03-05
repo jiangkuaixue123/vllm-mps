@@ -23,37 +23,31 @@ class MPSPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, head_size, dtype,
                              kv_cache_dtype, block_size, use_v1, use_mla):
-        # if use_mla:
-            # return "vllm_ascend.attention.AscendMLAAttentionBackend"
-        # return "vllm_ascend.attention.AscendAttentionBackend"
-        logger.info("jcz get_attn_backend_cls")
-        return ""
+        if use_mla or use_v1:
+            raise NotImplementedError
+        return "vllm_mps.attention.MPSAttentionBackend"
     
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Checks whether pin memory is available on the current platform."""
-        logger.info("jcz is_pin_memory_available")
+        logger.info("Currently MPS not support pin_memory")
         return False
     
     @classmethod
     def inference_mode(cls):
-        logger.info("jcz is_pin_memory_available")
         return torch.inference_mode()
     
     @classmethod
     def empty_cache(self):
-        logger.info("jcz is_pin_memory_available")
         return torch.mps.empty_cache()
     
     @classmethod
     def synchronize(cls):
-        logger.info("jcz is_pin_memory_available")
         torch.mps.synchronize()
     
     @classmethod
     def set_device(cls, device: torch.device):
-        logger.info(f"jcz set_device:{device}")
-        torch.set_device("mps")
+        torch.set_device(device)
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

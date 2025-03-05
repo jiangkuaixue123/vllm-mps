@@ -7,6 +7,8 @@ from torch import nn
 from vllm.attention import get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
                          ParallelConfig, VllmConfig)
+from vllm.distributed import (ensure_model_parallel_initialized,
+                              init_distributed_environment)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -32,7 +34,7 @@ class MPSCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig,
                  parallel_config: ParallelConfig,
                  device_config: DeviceConfig) -> None:
-        assert device_config.device_type == "cpu"
+        assert device_config.device_type == "mps"
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -115,20 +117,43 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         )
         if model_runner_cls is not None:
             self.model_runner = model_runner_cls(self.model_runner)
-        logger.info("jcz MPSWorker init 3")
+
         self.cache_engine: MPSCacheEngine
         self.cpu_cache: Optional[List[List[torch.Tensor]]] = None
 
     def init_device(self) -> None:
         if self.device_config.device.type == "mps":
-            current_platform.set_device(self.device)
+            self.device = torch.device("mps")
+            # current_platform.set_device(self.device)
 
             current_platform.empty_cache()
             # self.init_npu_memory = current_platform.mem_get_info()[0]
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
+        # Initialize the distributed environment.
+        self.init_distributed_environment()
         set_random_seed(self.model_config.seed)
+    
+    def init_distributed_environment(self) -> None:
+        """Initialize the distributed environment."""
+
+        parallel_config = self.parallel_config
+        rank = self.rank
+        distributed_init_method = self.distributed_init_method
+        init_distributed_environment(
+            world_size=parallel_config.world_size,
+            rank=rank,
+            distributed_init_method=distributed_init_method,
+            backend="gloo",
+        )
+
+        # A small all_reduce for warmup.
+        torch.distributed.all_reduce(torch.zeros(1).cpu())
+
+        ensure_model_parallel_initialized(
+            parallel_config.tensor_parallel_size,
+            parallel_config.pipeline_parallel_size)
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -262,3 +287,26 @@ class MPSWorker(LocalOrDistributedWorkerBase):
                 f"stored in KV cache ({max_seq_len}). Try increasing "
                 "`VLLM_CPU_KVCACHE_SPACE` or decreasing `max_model_len` when "
                 "initializing the engine.")
+
+    def _init_cache_engine(self) -> None:
+        self.cache_engine = [
+            MPSCacheEngine(self.cache_config, self.model_config,
+                           self.parallel_config, self.device_config)
+            for _ in range(self.parallel_config.pipeline_parallel_size)
+        ]
+        self.cpu_cache = [
+            self.cache_engine[ve].cpu_cache
+            for ve in range(self.parallel_config.pipeline_parallel_size)
+        ]
+        # bind_kv_cache(self.compilation_config.static_forward_context,
+        #               self.cpu_cache)
+        # self.model_runner.block_size = self.cache_engine[0].block_size
+
+        # assert all(
+        #     self.cpu_cache[ve] is not None
+        #     for ve in range(self.parallel_config.pipeline_parallel_size))
+
+        # # Populate the cache to warmup the memory
+        # for ve in range(self.parallel_config.pipeline_parallel_size):
+        #     for layer_cache in self.cpu_cache[ve]:
+        #         layer_cache.fill_(0)
