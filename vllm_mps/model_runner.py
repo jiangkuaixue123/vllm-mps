@@ -88,7 +88,7 @@ class MPSModelRunner(ModelRunnerBase[ModelInputForMPS]):
         # with torch.device
         self.device = torch.device("mps")
         self.model = get_model(vllm_config=self.vllm_config).to(self.device)
-
+        
         # self.model_memory_usage = m.consumed_memory
         # logger.info("Loading model weights took %.4f GB",
         #             self.model_memory_usage / float(2**30))

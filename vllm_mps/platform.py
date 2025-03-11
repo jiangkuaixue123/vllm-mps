@@ -55,6 +55,8 @@ class MPSPlatform(Platform):
     
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        import vllm.envs as envs
+        from vllm.utils import GiB_bytes
         logger.info("jcz check_and_update_config")
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
@@ -63,6 +65,24 @@ class MPSPlatform(Platform):
         if cache_config and cache_config.block_size is None:
             # TODO: Set block_size to 128 will lead unexpected accuracy issue in mla case.  Please set block_size to 128 back once the problem is fixed.
             cache_config.block_size = 16
+        
+        # Currently MPS use VLLM_CPU_KVCACHE_SPACE to represent the kv cache space.
+        kv_cache_space = envs.VLLM_CPU_KVCACHE_SPACE
+        logger.info(f"jcz kv_cache_space:{kv_cache_space}")
+        if kv_cache_space >= 0:
+            if kv_cache_space == 0:
+                # cache_config.cpu_kvcache_space_bytes = 4 * GiB_bytes  # type: ignore
+                cache_config.cpu_kvcache_space_bytes = torch.mps.recommended_max_memory()
+                logger.warning(
+                    f"Environment variable VLLM_CPU_KVCACHE_SPACE (GB) "
+                    f"for MPS backend is not set, using torch.mps.recommended_cache_size:"
+                    f"{cache_config.cpu_kvcache_space_bytes} by default.")
+            else:
+                cache_config.cpu_kvcache_space_bytes = kv_cache_space * GiB_bytes  # type: ignore # noqa
+        else:
+            raise RuntimeError(
+                "Invalid environment variable VLLM_CPU_KVCACHE_SPACE"
+                f" {kv_cache_space}, expect a positive integer value.")
     
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:

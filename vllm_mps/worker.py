@@ -47,7 +47,7 @@ class MPSCacheEngine:
         # Note: In CacheConfig, num_gpu_blocks actual is num_cpu_blocks
         # for CPU backend, because we want to reuse KV cache management
         # in the scheduler.
-        self.num_cpu_blocks = cache_config.num_gpu_blocks
+        self.num_gpu_blocks = cache_config.num_gpu_blocks
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype
@@ -64,7 +64,7 @@ class MPSCacheEngine:
         )
 
         # Initialize the cache.
-        self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks)
+        self.gpu_cache = self._allocate_kv_cache(self.num_gpu_blocks)
 
     @staticmethod
     def get_cache_block_size(
@@ -86,6 +86,22 @@ class MPSCacheEngine:
             dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
         dtype_size = torch.tensor([], dtype=dtype).element_size()
         return dtype_size * total
+    
+    def _allocate_kv_cache(self, num_blocks: int):
+        """
+        Allocate the KV cache on the device.
+        """
+        # Note: For MPS backend, we use CPU cache as GPU cache.
+        # The reason is that we want to reuse the cache management procedure
+        # in the scheduler.
+        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+            num_blocks, self.block_size, self.num_heads, self.head_size)
+        kv_cache: List[torch.Tensor] = []
+        for _ in range(self.num_layers):
+            kv_cache.append(
+                torch.empty(kv_cache_shape, dtype=self.dtype, device="mps")
+            )
+        return kv_cache
 
 
 class MPSWorker(LocalOrDistributedWorkerBase):
@@ -119,7 +135,7 @@ class MPSWorker(LocalOrDistributedWorkerBase):
             self.model_runner = model_runner_cls(self.model_runner)
 
         self.cache_engine: MPSCacheEngine
-        self.cpu_cache: Optional[List[List[torch.Tensor]]] = None
+        self.gpu_cache: Optional[List[List[torch.Tensor]]] = None
 
     def init_device(self) -> None:
         if self.device_config.device.type == "mps":
@@ -199,6 +215,8 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         # use cpu cache as 'gpu cache'.
         num_gpu_blocks = num_cpu_blocks
         num_cpu_blocks = 0
+        logger.info("jcz determine_num_available_blocks num_gpu_blocks:%d num_cpu_blocks:%d",
+                    num_gpu_blocks, num_cpu_blocks)
         return num_gpu_blocks, num_cpu_blocks
 
     def get_cache_block_size_bytes(self) -> int:
@@ -240,7 +258,7 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         model runner does not follow the ModelRunnerBase interface, then inherit
         from WorkerBase instead.
         """
-        return self.cpu_cache
+        return self.gpu_cache
 
     @torch.inference_mode()
     def prepare_worker_input(
@@ -294,8 +312,8 @@ class MPSWorker(LocalOrDistributedWorkerBase):
                            self.parallel_config, self.device_config)
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
-        self.cpu_cache = [
-            self.cache_engine[ve].cpu_cache
+        self.gpu_cache = [
+            self.cache_engine[ve].gpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
         ]
         # bind_kv_cache(self.compilation_config.static_forward_context,
