@@ -101,6 +101,7 @@ class MPSCacheEngine:
             kv_cache.append(
                 torch.empty(kv_cache_shape, dtype=self.dtype, device="mps")
             )
+        logger.warning(f"jcz current_allocated_memory:{torch.mps.current_allocated_memory()}")
         return kv_cache
 
 
@@ -118,6 +119,7 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         model_runner_cls: Optional[Type[ModelRunnerBase]] = None,
     ) -> None:
         WorkerBase.__init__(self, vllm_config=vllm_config)
+        logger.info("MPSWorker init")
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
@@ -137,13 +139,13 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         self.cache_engine: MPSCacheEngine
         self.gpu_cache: Optional[List[List[torch.Tensor]]] = None
 
+        #TODO: mps profile
+
     def init_device(self) -> None:
         if self.device_config.device.type == "mps":
             self.device = torch.device("mps")
-            # current_platform.set_device(self.device)
 
             current_platform.empty_cache()
-            # self.init_npu_memory = current_platform.mem_get_info()[0]
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
@@ -183,7 +185,7 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         logger.info("jcz initialize_cache num_gpu_blocks:%d num_cpu_blocks:%d",
                     num_gpu_blocks, num_cpu_blocks)
         
-        self._validate_num_cpu_blocks(num_cpu_blocks)
+        self._validate_num_mps_blocks(num_cpu_blocks)
         self.cache_config.num_gpu_blocks = num_cpu_blocks
         self.cache_config.num_cpu_blocks = 0
 
@@ -215,7 +217,7 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         # use cpu cache as 'gpu cache'.
         num_gpu_blocks = num_cpu_blocks
         num_cpu_blocks = 0
-        logger.info("jcz determine_num_available_blocks num_gpu_blocks:%d num_cpu_blocks:%d",
+        logger.warning("jcz determine_num_available_blocks num_gpu_blocks:%d num_cpu_blocks:%d",
                     num_gpu_blocks, num_cpu_blocks)
         return num_gpu_blocks, num_cpu_blocks
 
@@ -225,24 +227,20 @@ class MPSWorker(LocalOrDistributedWorkerBase):
             self.model_config, self.parallel_config)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        # raise NotImplementedError(
-        #     "LoRA is not implemented for MPS backend currently.")
-        pass
+        raise NotImplementedError(
+            "LoRA is not implemented for MPS backend currently.")
 
     def remove_lora(self, lora_id: int) -> bool:
-        # raise NotImplementedError(
-        #     "LoRA is not implemented for MPS backend currently.")
-        pass
+        raise NotImplementedError(
+            "LoRA is not implemented for MPS backend currently.")
 
     def pin_lora(self, lora_id: int) -> bool:
-        # raise NotImplementedError(
-        #     "LoRA is not implemented for MPS backend currently.")
-        pass
+        raise NotImplementedError(
+            "LoRA is not implemented for MPS backend currently.")
 
     def list_loras(self) -> Set[int]:
-        # raise NotImplementedError(
-        #     "LoRA is not implemented for MPS backend currently.")
-        pass
+        raise NotImplementedError(
+            "LoRA is not implemented for MPS backend currently.")
 
     @property
     def do_metadata_broadcast(self) -> bool:
@@ -272,7 +270,7 @@ class MPSWorker(LocalOrDistributedWorkerBase):
         virtual_engine: int = execute_model_req.virtual_engine
         num_seq_groups: int = len(execute_model_req.seq_group_metadata_list)
         blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
-                                      device="cpu",
+                                      device="mps",
                                       dtype=torch.int64).view(-1, 2)
         assert len(execute_model_req.blocks_to_swap_in) == 0
         assert len(execute_model_req.blocks_to_swap_out) == 0
@@ -282,22 +280,24 @@ class MPSWorker(LocalOrDistributedWorkerBase):
             virtual_engine=virtual_engine,
         )
         
-    @torch.inference_mode()
     def execute_worker(self, worker_input: WorkerInput) -> None:
         """
         Process an execution request.
         """
-        raise NotImplementedError
+        if (worker_input.blocks_to_copy is not None
+                and worker_input.blocks_to_copy.numel() > 0):
+            self.cache_engine[worker_input.virtual_engine].copy(
+                worker_input.blocks_to_copy)
     
-    def _validate_num_cpu_blocks(self, num_cpu_blocks: int) -> None:
-        """Raise errors if the num_cpu_blocks is invalid.
+    def _validate_num_mps_blocks(self, num_mps_blocks: int) -> None:
+        """Raise errors if the num_mps_blocks is invalid.
         """
-        if num_cpu_blocks <= 0:
+        if num_mps_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
                              "Try increasing `VLLM_CPU_KVCACHE_SPACE` when "
                              "initializing the engine.")
 
-        max_seq_len = self.cache_config.block_size * num_cpu_blocks
+        max_seq_len = self.cache_config.block_size * num_mps_blocks
         if self.model_config.max_model_len > max_seq_len:
             raise ValueError(
                 f"The model's max seq len ({self.model_config.max_model_len}) "

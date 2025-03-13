@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationLevel, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -16,6 +16,10 @@ class MPSPlatform(Platform):
     ray_device_key: str = "MPS"
 
     @classmethod
+    def get_device_name(cls, device_id: int = 0) -> str:
+        return "MPS"
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0):
         logger.info("jcz get_device_capability")
         return None
@@ -23,7 +27,7 @@ class MPSPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, head_size, dtype,
                              kv_cache_dtype, block_size, use_v1, use_mla):
-        if use_mla or use_v1:
+        if use_mla:
             raise NotImplementedError
         return "vllm_mps.attention.MPSAttentionBackend"
     
@@ -60,7 +64,10 @@ class MPSPlatform(Platform):
         logger.info("jcz check_and_update_config")
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_mps.worker.MPSWorker"
+            if envs.VLLM_USE_V1:
+                parallel_config.worker_cls = "vllm_mps.v1.worker.MPSWorker"
+            else:
+                parallel_config.worker_cls = "vllm_mps.worker.MPSWorker"
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
             # TODO: Set block_size to 128 will lead unexpected accuracy issue in mla case.  Please set block_size to 128 back once the problem is fixed.
@@ -83,6 +90,20 @@ class MPSPlatform(Platform):
             raise RuntimeError(
                 "Invalid environment variable VLLM_CPU_KVCACHE_SPACE"
                 f" {kv_cache_space}, expect a positive integer value.")
+        
+        if (parallel_config.distributed_executor_backend is not None
+                and parallel_config.distributed_executor_backend != "uni"):
+            logger.warning(("%s is not supported on MPS, fallback to uni "
+                            "distributed executor backend."),
+                           parallel_config.distributed_executor_backend)
+            parallel_config.distributed_executor_backend = "uni"
+        
+        compilation_config = vllm_config.compilation_config
+        if compilation_config.level != CompilationLevel.NO_COMPILATION:
+            logger.warning(
+                "Compilation level %s is not supported on MPS now, forcing compilation level to NO_COMPILATION",
+                compilation_config.level)
+            compilation_config.level = CompilationLevel.NO_COMPILATION
     
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:

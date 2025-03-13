@@ -28,6 +28,17 @@ TModelInputForMPS = TypeVar('TModelInputForMPS', bound="ModelInputForMPS")
 class ModelInputForMPS(ModelRunnerInputBase):
     pass
 
+class ModelInputForMPSBulder(ModelRunnerInputBuilderBase[ModelInputForMPS]):
+    def __init__(
+        self,
+        model_runner: ModelRunnerBase[ModelInputForMPS],
+        finished_requests_ids: Optional[List[str]] = None,
+    ):
+        ModelRunnerInputBuilderBase.__init__(self, model_runner,
+                                             finished_requests_ids)
+    def build(self) -> ModelInputForMPS:
+        return ModelInputForMPS()
+
 @dataclass(frozen=True)
 class ModelInputForMPSWithSamplingMetadata(ModelInputForMPS):
     """
@@ -64,7 +75,8 @@ class ModelInputForMPSWithSamplingMetadata(ModelInputForMPS):
 
 
 class MPSModelRunner(ModelRunnerBase[ModelInputForMPS]):
-
+    _model_input_cls: Type[TModelInputForMPS]
+    _builder_cls: Type[ModelInputForMPSBulder]
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -72,6 +84,10 @@ class MPSModelRunner(ModelRunnerBase[ModelInputForMPS]):
         is_driver_worker: bool = False,
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
+        
+        self.model: nn.Module
+
+        # Multi-modal currently not support
 
     def make_model_input_from_broadcasted_tensor_dict(
         self,
@@ -88,11 +104,9 @@ class MPSModelRunner(ModelRunnerBase[ModelInputForMPS]):
         # with torch.device
         self.device = torch.device("mps")
         self.model = get_model(vllm_config=self.vllm_config).to(self.device)
+
+        #TODO: lora support
         
-        # self.model_memory_usage = m.consumed_memory
-        # logger.info("Loading model weights took %.4f GB",
-        #             self.model_memory_usage / float(2**30))
-    
     def prepare_model_input(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -104,7 +118,50 @@ class MPSModelRunner(ModelRunnerBase[ModelInputForMPS]):
         request. This method may move data to the worker's local device. It is
         not allowed to communicate with other workers or devices.
         """
-        return None
+        model_input = self._prepare_model_input_tensors(
+            seq_group_metadata_list, finished_requests_ids)
+        #TODO: PP support
+
+        return model_input
+    
+    def _prepare_model_input_tensors(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        finished_requests_ids: Optional[List[str]] = None
+    ) -> TModelInputForMPS:
+        """Helper method to prepare the model input based on a given sequence
+        group. Prepares metadata needed for the base model forward pass but not
+        metadata for possible additional steps, e.g., sampling.
+
+        """
+        builder = self._builder_cls(weakref.proxy(self), finished_requests_ids)
+        builder.prepare(finished_requests_ids)
+        for seq_group_metadata in seq_group_metadata_list:
+            builder.add_seq_group(seq_group_metadata)
+
+        builder.reset_cached_inter_data()
+
+        return builder.build()  # type: ignore
+
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    def remove_all_loras(self):
+        raise RuntimeError("LoRA is not supported on MPS now.")
+
+    def set_active_loras(self, lora_requests: Set[LoRARequest],
+                         lora_mapping: LoRAMapping) -> None:
+        raise RuntimeError("LoRA is not supported on MPS now.")
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        raise RuntimeError("LoRA is not supported on MPS now.")
+
+    def remove_lora(self, lora_id: int) -> bool:
+        raise RuntimeError("LoRA is not supported on MPS now.")
+
+    def pin_lora(self, lora_id: int) -> bool:
+        raise RuntimeError("LoRA is not supported on MPS now.")
+
+    def list_loras(self) -> Set[int]:
+        raise RuntimeError("LoRA is not supported on MPS now.")
