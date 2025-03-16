@@ -14,16 +14,34 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 @dataclass
-class MPSMetadata(AttentionMetadata):
-    @property
-    def prefill_metadata(self) -> Optional["MPSMetadata"]:
-        pass
-    
-    @property
-    def decode_metadata(self) -> Optional["MPSMetadata"]:
-        pass
+class MPSAttentionMetadata:
+    # NOTE(sang): Definition of context_len, query_len, and seq_len.
+    # |---------- N-1 iteration --------|
+    # |---------------- N iteration ---------------------|
+    # |- tokenA -|......................|-- newTokens ---|
+    # |---------- context_len ----------|
+    # |-------------------- seq_len ---------------------|
+    #                                   |-- query_len ---|
 
-class MPSMetadataBuilder(CommonMetadataBuilder[MPSMetadata]):
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+
+    # For cascade attention.
+    use_cascade: bool
+    common_prefix_len: int
+    cu_prefix_query_lens: Optional[torch.Tensor]
+    prefix_kv_lens: Optional[torch.Tensor]
+    suffix_kv_lens: Optional[torch.Tensor]
+
+    # For logging.
+    num_input_tokens: int = 0  # Number of tokens including padding.
+
+class MPSMetadataBuilder(CommonMetadataBuilder[MPSAttentionMetadata]):
     pass
 
 class MPSAttentionBackendImpl(AttentionImpl):
@@ -80,7 +98,7 @@ class MPSAttentionBackendImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: MPSMetadata,
+        attn_metadata: MPSAttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_type = self.attn_type
@@ -108,8 +126,8 @@ class MPSAttentionBackend(AttentionBackend):
         return MPSAttentionBackendImpl
 
     @staticmethod
-    def get_metadata_cls() -> Type["MPSMetadata"]:
-        return MPSMetadata
+    def get_metadata_cls() -> Type["MPSAttentionMetadata"]:
+        return MPSAttentionMetadata
 
     @staticmethod
     def get_state_cls() -> Type["CommonAttentionState"]:
