@@ -413,14 +413,6 @@ class MPSModelRunner:
         if batch_changed:
             self.input_batch.refresh_sampling_metadata()
 
-    def _process_reqs(
-        self,
-        scheduler_output: "SchedulerOutput",
-        intermediate_tensors: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        # TODO: Need implement
-        pass
-
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -671,8 +663,9 @@ class MPSModelRunner:
         
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        logger.warning(f"jcz begin hidden_states input_ids: {input_ids}")
-        logger.warning(f"jcz begin hidden_states positions: {positions}")
+        logger.warning(f"jcz begin hidden_states input_ids: {input_ids} "
+                       f"positions: {positions}"
+                       f"inputs_embeds: {inputs_embeds}")
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
                 input_ids=input_ids,

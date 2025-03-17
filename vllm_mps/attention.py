@@ -41,8 +41,6 @@ class MPSAttentionMetadata:
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
-class MPSMetadataBuilder(CommonMetadataBuilder[MPSAttentionMetadata]):
-    pass
 
 class MPSAttentionBackendImpl(AttentionImpl):
 
@@ -68,7 +66,8 @@ class MPSAttentionBackendImpl(AttentionImpl):
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads
+        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.hidden_size = self.num_heads * self.head_size
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -101,25 +100,93 @@ class MPSAttentionBackendImpl(AttentionImpl):
         attn_metadata: MPSAttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        attn_type = self.attn_type
-        if (attn_type == AttentionType.ENCODER
-                and (not attn_metadata.is_all_encoder_attn_metadata_set)):
-            raise AttributeError("Encoder attention requires setting "
-                                 "encoder metadata attributes.")
-        elif (attn_type == AttentionType.ENCODER_DECODER
-              and (not attn_metadata.is_all_cross_attn_metadata_set)):
-            raise AttributeError("Encoder/decoder cross-attention "
-                                 "requires setting cross-attention "
-                                 "metadata attributes.")
+        """Forward pass with FlashAttention.
+
+        Args:
+            query: shape = [num_tokens, num_heads, head_size]
+            key: shape = [num_tokens, num_kv_heads, head_size]
+            value: shape = [num_tokens, num_kv_heads, head_size]
+            kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
+            attn_metadata: Metadata for attention.
+        Returns:
+            shape = [num_tokens, num_heads * head_size]
+        """
+        logger.warning(f"jcz layer:{layer}")
+        logger.warning(f"jcz 1 query:{query.shape}, key:{key.shape}, value:{value.shape}, kv_cache:{kv_cache.shape}")
+        num_tokens = query.shape[0]
+        if output is None:
+            logger.warning("jcz 2 output is None")
+            output = torch.empty(num_tokens,
+                                self.num_heads,
+                                self.head_size,
+                                dtype=query.dtype,
+                                device=query.device)
         
-        return None
+        if attn_metadata is None:
+            logger.warning("MPS backend does not support attn_metadata is None")
+            return output.view(num_tokens, self.hidden_size)
+
+        assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
+        attn_type = self.attn_type
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError("Encoder self-attention and "
+                                      "encoder/decoder cross-attention "
+                                      "are not implemented for "
+                                      "PallasAttentionBackendImpl")
+        # View q k v to BSH.
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        # TODO: Remove this contiguous in the future.
+        value = value.contiguous()
+        logger.warning(f"jcz 2 query:{query.shape}, key:{key.shape}, value:{value.shape}, kv_cache:{kv_cache.shape}")
+
+        if hasattr(layer, 'quant_method'):
+            # TODO: Add attr (num_prefills, prefill_metadata, decode_metadata) to AscendMetadata
+            pass
+        else:
+            if kv_cache.numel() > 0:
+                key_cache, value_cache = kv_cache[0], kv_cache[1]
+                num_blocks, block_size, _ = key_cache.shape
+                key_cache = key_cache.view(num_blocks, block_size,
+                                           self.num_kv_heads, self.head_size)
+                value_cache = value_cache.view(num_blocks, block_size,
+                                               self.num_kv_heads,
+                                               self.head_size)
+                slots = attn_metadata.slot_mapping
+                logger.warning(f"jcz 3 slot:{slots}")
+                # torch_npu._npu_reshape_and_cache(key=key,
+                #                                  value=value,
+                #                                  key_cache=key_cache,
+                #                                  value_cache=value_cache,
+                #                                  slot_indices=slots)
+            # # use paged attention
+            # torch_npu._npu_paged_attention_splitfuse(
+            #     query=query,
+            #     key_cache=key_cache,
+            #     value_cache=value_cache,
+            #     mask=attn_metadata.attn_mask,
+            #     block_table=attn_metadata.block_tables,
+            #     seq_len=attn_metadata.seq_lens,
+            #     context_lens=attn_metadata.context_lens,
+            #     num_kv_heads=self.num_kv_heads,
+            #     num_heads=self.num_heads,
+            #     scale_value=self.scale,
+            #     out=output)
+        return output.view(num_tokens, self.hidden_size)
 
 
 class MPSAttentionBackend(AttentionBackend):
 
+    # accept_output_buffer: bool = True
+
+    @staticmethod
+    def get_supported_head_sizes() -> List[int]:
+        return [32, 64, 96, 128, 160, 192, 224, 256]
+
     @staticmethod
     def get_name() -> str:
-        return "MPS"
+        return "MPS_ATTN_VLLM_V1"
 
     @staticmethod
     def get_impl_cls() -> Type["MPSAttentionBackendImpl"]:
@@ -128,10 +195,6 @@ class MPSAttentionBackend(AttentionBackend):
     @staticmethod
     def get_metadata_cls() -> Type["MPSAttentionMetadata"]:
         return MPSAttentionMetadata
-
-    @staticmethod
-    def get_state_cls() -> Type["CommonAttentionState"]:
-        return CommonAttentionState
 
     @staticmethod
     def get_kv_cache_shape(
@@ -143,39 +206,5 @@ class MPSAttentionBackend(AttentionBackend):
         return (2, num_blocks, block_size, num_kv_heads * head_size)
 
     @staticmethod
-    def swap_blocks(
-        src_kv_cache: List[torch.Tensor],
-        dst_kv_cache: List[torch.Tensor],
-        src_to_dst: torch.Tensor,
-    ) -> None:
-        src_key_cache, src_value_cache = src_kv_cache[0], src_kv_cache[1]
-        dst_key_cache, dst_value_cache = dst_kv_cache[0], dst_kv_cache[1]
-        src_indices = src_to_dst[:, 0]
-        dst_indices = src_to_dst[:, 1]
-
-        dst_key_cache[dst_indices] = src_key_cache[src_indices].to(
-            dst_key_cache.device)
-        dst_value_cache[dst_indices] = src_value_cache[src_indices].to(
-            dst_key_cache.device)
-
-    @staticmethod
-    def copy_blocks(
-        kv_caches: List[torch.Tensor],
-        src_to_dists: torch.Tensor,
-    ) -> None:
-        src_indices = src_to_dists[:, 0]
-        dst_indices = src_to_dists[:, 1]
-
-        for kv_cache in kv_caches:
-            key_caches = kv_cache[0]
-            value_caches = kv_cache[1]
-            key_caches[dst_indices] = key_caches[src_indices]
-            value_caches[dst_indices] = value_caches[src_indices]
-
-    @staticmethod
-    def get_builder_cls() -> Type["MPSMetadataBuilder"]:
-        return MPSMetadataBuilder
-
-    @classmethod
-    def make_metadata_builder(cls, *args, **kwargs) -> "MPSMetadataBuilder":
-        return cls.get_builder_cls()(*args, **kwargs)
+    def use_cascade_attention(*args, **kwargs) -> bool:
+        return use_cascade_attention(*args, **kwargs)
